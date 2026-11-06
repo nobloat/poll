@@ -19,7 +19,7 @@ Every change follows `nobloat` → "Change an existing project" (`../skill/noblo
 4. Clarify open topics: one numbered list, a recommended default per item.
 5. Suggest the code layout and any interfaces (files, signatures, request and response types between services).
 6. Wait for the owner's confirmation, then implement in one pass.
-7. Automated tests, then end to end in the whole stack: [nobloat/system](https://github.com/nobloat/system) (`make local`, `make local-check`; from a sibling checkout `make local SRC=..`).
+7. Automated tests, then end to end in the whole stack: [nobloat/system](https://github.com/nobloat/system) (`make local-source` or `make local-images`, then `make local-check`; from a sibling checkout `make local-source SRC=..`).
 8. Adapt CI (`.github/workflows/ci.yml`) until it is green, push to `main`. Releases: `make release APP=<this repo>` in nobloat/system.
 
 This repo is a submodule of nobloat/system, which checks out every component side by side; changes spanning several components are driven from there.
