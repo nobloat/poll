@@ -13,6 +13,7 @@ import (
 	"io/fs"
 	"log"
 	"maps"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -29,37 +30,57 @@ import (
 //go:embed templates mail static i18n
 var assets embed.FS
 
-const maxBody = 64 << 10
+const (
+	maxBody    = 64 << 10
+	maxAnswers = 500 // per poll (owner decision 2026-11-20)
+	// retentionDays after its last change a poll is deleted (owner decision 2026-11-20).
+	retentionDays = 180
+	// authFailures failed admin logins per client IP within authWindow answer 429 until the window passes.
+	authFailures = 10
+	authWindow   = 10 * time.Minute
+)
 
 var (
-	errClosed  = errors.New("poll closed")
-	errLocked  = errors.New("options locked")
-	errInvalid = errors.New("invalid input")
-	errChoice  = errors.New("invalid choice")
-	errPow     = errors.New("proof of work failed")
+	errClosed    = errors.New("poll closed")
+	errLocked    = errors.New("options locked")
+	errInvalid   = errors.New("invalid input")
+	errChoice    = errors.New("invalid choice")
+	errPow       = errors.New("proof of work failed")
+	errFull      = errors.New("poll full")
+	errBusy      = errors.New("rate limited")
+	errMailLimit = errors.New("mail rate limit")
 )
 
 type config struct {
-	BaseURL       string
-	AdminPassword string
-	Loc           *time.Location
-	Difficulty    int
-	PublicCreate  bool
-	Theme         string
-	DataDir       string
-	Addr          string
-	SMTP          smtpConfig
+	BaseURL        string
+	AdminPassword  string
+	AdminEmail     string
+	Loc            *time.Location
+	Difficulty     int
+	MailDifficulty int // proof of work for requests that mail an address typed into the form
+	MailPerAddress int // mails per hour to one address, 0: no limit
+	MailPerHour    int // mails per hour in total, 0: no limit
+	CreatePerHour  int // polls created per hour without admin auth, 0: no limit
+	PublicCreate   bool
+	Theme          string
+	DataDir        string
+	Addr           string
+	SMTP           smtpConfig
 }
 
 type server struct {
-	cfg      config
-	store    *store
-	pow      *pow
-	now      func() time.Time
-	outbox   *outbox
-	pages    map[string]*template.Template
-	mailText *ttemplate.Template
-	themes   map[string][]byte
+	cfg       config
+	store     *store
+	pow       *pow
+	now       func() time.Time
+	outbox    *outbox
+	pages     map[string]*template.Template
+	mailText  *ttemplate.Template
+	themes    map[string][]byte
+	mails     limiter // per recipient and in total, per hour
+	creations limiter // public creations per hour
+	authFails limiter // failed admin logins per client IP
+	changes   limiter // "changed" notifications per answer
 }
 
 func newServer(cfg config, now func() time.Time, send func(Mail) error) (*server, error) {
@@ -70,7 +91,9 @@ func newServer(cfg config, now func() time.Time, send func(Mail) error) (*server
 	if cfg.Theme == "" {
 		cfg.Theme = "minimal"
 	}
-	s := &server{cfg: cfg, store: st, pow: newPow(cfg.Difficulty, now), now: now, pages: map[string]*template.Template{}}
+	s := &server{cfg: cfg, store: st, pow: newPow(cfg.Difficulty, now), now: now, pages: map[string]*template.Template{},
+		mails: limiter{every: time.Hour}, creations: limiter{every: time.Hour}, authFails: limiter{every: authWindow},
+		changes: limiter{every: 10 * time.Minute}}
 	funcs := template.FuncMap{
 		"t":       T,
 		"in":      func(v url.Values, k, s string) bool { return slices.Contains(v[k], s) },
@@ -102,7 +125,11 @@ func (s *server) handler() http.Handler {
 	mux.Handle("GET /static/", http.FileServerFS(assets))
 	mux.HandleFunc("GET /theme.css", s.theme)
 	mux.HandleFunc("GET /pow", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "%d %s", s.cfg.Difficulty, s.pow.issue())
+		bits := s.cfg.Difficulty
+		if r.URL.Query().Has("mail") {
+			bits = max(bits, s.cfg.MailDifficulty)
+		}
+		fmt.Fprintf(w, "%d %s", bits, s.pow.issue(bits))
 	})
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.PublicCreate {
@@ -123,7 +150,7 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /p/{id}", s.submit)
 	mux.HandleFunc("GET /p/{id}/a/{token}", s.answerPage)
 	mux.HandleFunc("GET /p/{id}/a/{token}/thanks", s.thanks)
-	mux.HandleFunc("GET /p/{id}/answered", s.answered)
+	mux.HandleFunc("GET /p/{id}/sent", s.sent)
 	mux.HandleFunc("GET /p/{id}/removed", s.removed)
 	mux.HandleFunc("POST /p/{id}/a/{token}/update", s.updateAnswer)
 	mux.HandleFunc("GET /p/{id}/a/{token}/remove", s.removeConfirm)
@@ -180,13 +207,34 @@ func (s *server) isAdmin(r *http.Request) bool {
 
 func (s *server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := clientIP(r)
+		if s.authFails.over(s.now(), ip, authFailures) {
+			s.message(w, r, http.StatusTooManyRequests, "busy.title", "busy.text", "", "")
+			return
+		}
 		if !s.isAdmin(r) {
+			if _, _, sent := r.BasicAuth(); sent {
+				s.authFails.allow(s.now(), limit{ip, 0})
+				log.Printf("admin login failed from %s", ip)
+			}
 			w.Header().Set("WWW-Authenticate", `Basic realm="][/poll", charset="UTF-8"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// clientIP is the address the proxy in front (caddy) put last into X-Forwarded-For, else the peer address.
+// ponytail: trusts X-Forwarded-For; poll is meant to run behind a proxy that sets it (README), add a
+// trusted-proxy list if it is ever exposed directly.
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Values("X-Forwarded-For"); len(xff) > 0 {
+		last := xff[len(xff)-1]
+		return strings.TrimSpace(last[strings.LastIndexByte(last, ',')+1:])
+	}
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	return host
 }
 
 var themeNames = sync.OnceValue(func() []string {
@@ -346,6 +394,10 @@ func (s *server) fail(w http.ResponseWriter, r *http.Request, err error) {
 		s.message(w, r, http.StatusConflict, "locked.title", "locked.text", "", "")
 	case errors.Is(err, errPow):
 		s.message(w, r, http.StatusBadRequest, "invalid.title", "err.pow", "", "")
+	case errors.Is(err, errFull):
+		s.message(w, r, http.StatusConflict, "full.title", "full.text", "", "")
+	case errors.Is(err, errBusy):
+		s.message(w, r, http.StatusTooManyRequests, "busy.title", "busy.text", "", "")
 	case errors.Is(err, errChoice):
 		s.message(w, r, http.StatusBadRequest, "invalid.title", "err.choice", "", "")
 	case errors.As(err, new(*http.MaxBytesError)):
@@ -365,7 +417,6 @@ type mailData struct {
 	Link    string
 	Event   string
 	Choices []string
-	Results []result
 	ICS     bool
 	Public  string
 }
@@ -377,6 +428,10 @@ func (s *server) answerLink(p *Poll, a *Answer) string {
 func (s *server) mail(to, name, subject string, d mailData, ics []byte) error {
 	if to == "" {
 		return nil
+	}
+	if !s.mails.allow(s.now(), limit{"to:" + to, s.cfg.MailPerAddress}, limit{"", s.cfg.MailPerHour}) {
+		log.Printf("mail %s to=%q subject=%q: not queued, rate limit reached", name, to, subject)
+		return errMailLimit
 	}
 	var txt bytes.Buffer
 	err := s.mailText.ExecuteTemplate(&txt, name+".txt", d)
@@ -399,8 +454,7 @@ func (s *server) notifyOwner(p *Poll, a *Answer, event string) {
 		choices = append(choices, p.Options[c].Text)
 	}
 	s.mail(p.OwnerEmail, "admin", T(p.OwnerLang, "mail.admin.subject."+event, a.Name, p.Title),
-		mailData{Lang: p.OwnerLang, Poll: p, Answer: a, Event: event, Choices: choices, Link: s.ownerLink(p),
-			Results: results(p)}, nil)
+		mailData{Lang: p.OwnerLang, Poll: p, Answer: a, Event: event, Choices: choices, Link: s.ownerLink(p)}, nil)
 }
 
 func (s *server) mailClosed(p *Poll, a *Answer) {
@@ -458,7 +512,7 @@ func (s *server) submit(w http.ResponseWriter, r *http.Request) {
 	case p.Closed:
 		s.fail(w, r, errClosed)
 		return
-	case name == "" || utf8.RuneCountInString(name) > 100:
+	case !validName(name):
 		errKey = "err.name"
 	case email != "" && !validEmail(email):
 		errKey = "err.email"
@@ -473,13 +527,21 @@ func (s *server) submit(w http.ResponseWriter, r *http.Request) {
 		s.render(w, r, http.StatusBadRequest, "poll", pg)
 		return
 	}
-	var added *Answer
+	if email != "" && !s.mailProved(r) {
+		s.fail(w, r, errPow)
+		return
+	}
+	var added, existing *Answer
 	p, err = s.store.update(id, func(p *Poll) (string, error) {
 		if p.Closed {
 			return "", errClosed
 		}
-		if a := p.byEmail(email); email != "" && a != nil {
-			return fmt.Sprintf("answer %v not added again, email already answered", a), nil
+		if existing = p.byEmail(email); email != "" && existing != nil {
+			return "", errExists
+		}
+		existing = nil
+		if len(p.Answers) >= maxAnswers {
+			return "", errFull
 		}
 		if choices, okChoices = parseChoices(p, f["choice"]); !okChoices {
 			return "", errChoice
@@ -488,17 +550,37 @@ func (s *server) submit(w http.ResponseWriter, r *http.Request) {
 		p.Answers = append(p.Answers, added)
 		return fmt.Sprintf("answer %v added", added), nil
 	})
-	if err != nil {
+	switch {
+	case existing != nil:
+		// The same answer as for a new address, so the page tells nobody whether an address took part; the
+		// address gets its existing link again.
+		log.Printf("poll %s: answer %v not added again, email already answered; link mailed again", id, existing)
+		s.mailLink(p, existing)
+	case err != nil:
 		s.fail(w, r, err)
 		return
+	default:
+		s.mailLink(p, added)
+		s.notifyOwner(p, added, "new")
 	}
-	if added == nil {
-		http.Redirect(w, r, "/p/"+p.ID+"/answered", http.StatusSeeOther)
+	if email == "" {
+		http.Redirect(w, r, "/p/"+p.ID+"/a/"+added.Token+"/thanks", http.StatusSeeOther)
 		return
 	}
-	s.mailLink(p, added)
-	s.notifyOwner(p, added, "new")
-	http.Redirect(w, r, "/p/"+p.ID+"/a/"+added.Token+"/thanks", http.StatusSeeOther)
+	http.Redirect(w, r, "/p/"+p.ID+"/sent", http.StatusSeeOther)
+}
+
+func validName(name string) bool {
+	return name != "" && utf8.RuneCountInString(name) <= 100 && singleLine(name)
+}
+
+// mailProved reports whether the request's proof of work has the difficulty for sending mail to a typed address.
+func (s *server) mailProved(r *http.Request) bool {
+	return challengeBits(r.PostForm.Get("pow")) >= s.cfg.MailDifficulty
+}
+
+func (s *server) sent(w http.ResponseWriter, r *http.Request) {
+	s.message(w, r, http.StatusOK, "sent.title", "sent.mail", "", "")
 }
 
 func (s *server) thanks(w http.ResponseWriter, r *http.Request) {
@@ -515,10 +597,6 @@ func (s *server) thanks(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) removed(w http.ResponseWriter, r *http.Request) {
 	s.message(w, r, http.StatusOK, "removed.title", "removed.text", "/p/"+r.PathValue("id"), "removed.back")
-}
-
-func (s *server) answered(w http.ResponseWriter, r *http.Request) {
-	s.message(w, r, http.StatusOK, "dup.title", "dup.text", "", "")
 }
 
 func (s *server) lookup(w http.ResponseWriter, r *http.Request) (*Poll, *Answer) {
@@ -564,6 +642,7 @@ func (s *server) act(r *http.Request, fn func(p *Poll, a *Answer) (string, error
 }
 
 func (s *server) updateAnswer(w http.ResponseWriter, r *http.Request) {
+	changed := false
 	p, a, err := s.act(r, func(p *Poll, a *Answer) (string, error) {
 		if p.Closed {
 			return "", errClosed
@@ -572,6 +651,7 @@ func (s *server) updateAnswer(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return "", errChoice
 		}
+		changed = !slices.Equal(a.Choices, cs)
 		a.Choices = cs
 		return fmt.Sprintf("changed by participant to %v", cs), nil
 	})
@@ -579,7 +659,10 @@ func (s *server) updateAnswer(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	s.notifyOwner(p, a, "changed")
+	// Autosave posts on every click: notify only on a real change, at most once per answer per 10 minutes.
+	if changed && s.changes.allow(s.now(), limit{a.Token, 1}) {
+		s.notifyOwner(p, a, "changed")
+	}
 	if autosave(r) {
 		w.WriteHeader(http.StatusNoContent)
 		return

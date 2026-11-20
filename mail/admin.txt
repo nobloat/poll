@@ -2,12 +2,7 @@
 
 {{t .Lang "poll.name"}}: {{.Answer.Name}}
 {{if ne .Event "removed"}}{{range .Choices}}  x {{.}}
+{{else}}  {{t .Lang "results.none"}}
 {{end}}{{end}}
-# {{t .Lang "results.title"}}
-{{range .Results}}
-{{printf "%02d" (inc .Index)}} {{.Option.Text}}  [{{len .Names}}] {{.Bar}}
-{{if .Names}}   {{range $i, $n := .Names}}{{if $i}}, {{end}}{{$n}}{{end}}
-{{end}}{{end}}
-{{with .Poll.None}}{{t $.Lang "results.none"}}: {{range $i, $a := .}}{{if $i}}, {{end}}{{$a.Name}}{{end}}
-{{end}}
+{{t .Lang "mail.admin.results"}}
 {{.Link}}

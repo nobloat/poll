@@ -14,8 +14,8 @@ A minimal alternative to Doodle, born out of frustration with it's ongoing *ensh
 
 - Create and ansswer polls without an account
 - Optional mails via SMTP with personal links to manage a poll or change an answer
-- GDPR friendly: each poll is one `.json` file
-- Spam protection without CAPTCHAs with proof of work
+- GDPR friendly: each poll is one `.json` file, deleted 180 days after its last change
+- Spam protection without CAPTCHAs with proof of work, plus [limits](#limits)
 - Admin (Basic Auth) can list and manage all polls
 - Easy [theming](#theming), with light and dark mode.
 - [Translations](#translations): English, German, French, Spanish
@@ -80,6 +80,20 @@ services:
     volumes: [./data:/data]
     ports: ["127.0.0.1:8737:8737"]
 ```
+
+## Limits
+
+Owner decision 2026-11-20, review fixes:
+
+- Every POST needs a proof of work (16 bits); one that mails an address typed into the form (creating or answering with an email) needs 20 bits. Challenges are valid for 10 minutes and once.
+- At most 500 answers per poll; at most 100 polls per hour are created without admin auth (then 429)
+- Mail: at most 5 per hour to one address and 200 per hour in total; mails over the limit are not queued, only logged
+- The owner gets a "changed" mail only when the choices really change, at most once per answer per 10 minutes; owner notifications carry the participant's choices and the manage link, not all results
+- Answering with an address that already answered looks the same as a new answer and mails that address its existing link again
+- Titles and names cannot contain line breaks
+- Polls are deleted 180 days after their file was last written (created, answered, edited, closed); the sweep runs at start and daily
+- Admin basic auth: 10 failed logins within 10 minutes from one client IP (the last `X-Forwarded-For` entry, so run poll behind a proxy that sets it) answer 429 until the window passes
+- Outbox: a mail is retried with backoff and moved to `data/mail/failed/` (logged) after 3 days or on an SMTP 5xx reply to MAIL, RCPT or DATA; an unreadable queued mail is renamed to `.invalid` and skipped
 
 ## Theming
 

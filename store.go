@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io/fs"
 	"log"
 	"os"
@@ -101,9 +102,19 @@ func (p *Poll) OptionsText() string {
 	return strings.Join(lines, "\n")
 }
 
+// store keeps one JSON file per poll. Writes are atomic renames, so reads take no lock; changes to one poll are
+// serialised by one of a fixed set of mutexes picked by its ID.
 type store struct {
-	dir string
-	mu  sync.Mutex
+	dir   string
+	locks [64]sync.Mutex
+}
+
+func (s *store) lock(id string) (unlock func()) {
+	h := fnv.New32a()
+	h.Write([]byte(id))
+	mu := &s.locks[h.Sum32()%uint32(len(s.locks))]
+	mu.Lock()
+	return mu.Unlock
 }
 
 func openStore(dataDir string) (*store, error) {
@@ -162,15 +173,13 @@ func (s *store) write(p *Poll) error {
 	return s.syncDir()
 }
 
-func (s *store) get(id string) (*Poll, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.read(id)
-}
+func (s *store) get(id string) (*Poll, error) { return s.read(id) }
 
 func (s *store) update(id string, fn func(*Poll) (string, error)) (*Poll, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if !validID(id) {
+		return nil, errNotFound
+	}
+	defer s.lock(id)()
 	p, err := s.read(id)
 	if err != nil {
 		return nil, err
@@ -190,8 +199,7 @@ func (s *store) logged(id, action string, err error) error {
 }
 
 func (s *store) create(p *Poll, action string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer s.lock(p.ID)()
 	if _, err := os.Stat(s.path(p.ID)); !errors.Is(err, fs.ErrNotExist) {
 		if err == nil {
 			return errExists
@@ -202,8 +210,10 @@ func (s *store) create(p *Poll, action string) error {
 }
 
 func (s *store) delete(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if !validID(id) {
+		return errNotFound
+	}
+	defer s.lock(id)()
 	p, err := s.read(id)
 	if err != nil {
 		return err
@@ -226,9 +236,8 @@ func (s *store) syncDir() error {
 	return d.Sync()
 }
 
+// list returns every readable poll; an unreadable or stray file is logged and skipped.
 func (s *store) list() ([]*Poll, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	files, err := filepath.Glob(filepath.Join(s.dir, "*.json"))
 	if err != nil {
 		return nil, err
@@ -237,10 +246,35 @@ func (s *store) list() ([]*Poll, error) {
 	for _, f := range files {
 		p, err := s.read(strings.TrimSuffix(filepath.Base(f), ".json"))
 		if err != nil {
-			return nil, err
+			log.Printf("poll list: skipping %s: %v", filepath.Base(f), err)
+			continue
 		}
 		polls = append(polls, p)
 	}
 	slices.SortFunc(polls, func(a, b *Poll) int { return b.Created.Compare(a.Created) })
 	return polls, nil
+}
+
+// sweep deletes every poll whose file was last written (created, answered, edited, closed) before cutoff.
+func (s *store) sweep(cutoff time.Time) {
+	files, err := filepath.Glob(filepath.Join(s.dir, "*.json"))
+	if err != nil {
+		log.Printf("poll sweep: %v", err)
+		return
+	}
+	for _, f := range files {
+		id := strings.TrimSuffix(filepath.Base(f), ".json")
+		unlock := s.lock(id)
+		if fi, err := os.Stat(f); err == nil && fi.ModTime().Before(cutoff) {
+			if err := os.Remove(f); err != nil {
+				log.Printf("poll sweep: %v", err)
+			} else {
+				log.Printf("poll %s: deleted, no activity since %s", id, fi.ModTime().Format(time.DateOnly))
+			}
+		}
+		unlock()
+	}
+	if err := s.syncDir(); err != nil {
+		log.Printf("poll sweep: %v", err)
+	}
 }

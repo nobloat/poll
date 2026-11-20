@@ -14,10 +14,15 @@ customElements.define('auto-save', class extends HTMLElement {
         say('saving');
         try {
           const body = new URLSearchParams(new FormData(form));
-          const p = await next;
-          next = proof();
-          for (const k in p) body.set(k, p[k]);
-          const res = await fetch(form.action, { method: 'POST', body, headers: { 'X-Autosave': '1' }, keepalive });
+          const post = async () => {
+            const p = await next;
+            next = proof();
+            for (const k in p) body.set(k, p[k]);
+            return fetch(form.action, { method: 'POST', body, headers: { 'X-Autosave': '1' }, keepalive });
+          };
+          let res = await post();
+          // A proof solved long ago may have expired (or the server restarted): retry once with a fresh one.
+          if (res.status === 400) res = await post();
           if (res.ok) say('saved', `${this.getAttribute('saved')} ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`);
           else say('error', (await res.text()).trim());
         } catch { next = proof(); say('error', this.getAttribute('failed')); }
@@ -79,8 +84,9 @@ async function solve(challenge, bits) {
   }
 }
 
-async function proof() {
-  const [bits, pow] = (await (await fetch('/pow')).text()).split(' ');
+// mail: the request mails an address typed into the form, which needs a harder proof.
+async function proof(mail = false) {
+  const [bits, pow] = (await (await fetch(mail ? '/pow?mail=1' : '/pow')).text()).split(' ');
   return { pow, nonce: await solve(pow, +bits) };
 }
 
@@ -95,7 +101,7 @@ document.addEventListener('submit', async (e) => {
   const status = form.querySelector('.pow-status');
   if (status) status.textContent = status.dataset.working;
   try {
-    const p = await proof();
+    const p = await proof(!!form.elements.email?.value.trim());
     form.querySelectorAll('[data-pow]').forEach((el) => el.remove());
     for (const k in p) form.insertAdjacentHTML('beforeend', `<input type="hidden" name="${k}" value="${p[k]}" data-pow>`);
     form.dataset.proved = 1;

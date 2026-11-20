@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"slices"
@@ -122,7 +123,7 @@ func (s *server) createPoll(w http.ResponseWriter, r *http.Request) {
 	email := strings.ToLower(strings.TrimSpace(f.Get("email")))
 	switch {
 	case errKey != "":
-	case name == "" || utf8.RuneCountInString(name) > 100:
+	case !validName(name):
 		errKey = "err.name"
 	case email != "" && !validEmail(email):
 		errKey = "err.email"
@@ -130,6 +131,19 @@ func (s *server) createPoll(w http.ResponseWriter, r *http.Request) {
 	if errKey != "" {
 		s.newPage(w, r, http.StatusBadRequest, f, errKey)
 		return
+	}
+	if email != "" && !s.mailProved(r) {
+		s.fail(w, r, errPow)
+		return
+	}
+	admin := s.isAdmin(r)
+	if !admin && !s.creations.allow(s.now(), limit{"", s.cfg.CreatePerHour}) {
+		log.Printf("poll creation refused: %d per hour reached", s.cfg.CreatePerHour)
+		s.fail(w, r, errBusy)
+		return
+	}
+	if email == "" && admin {
+		email = s.cfg.AdminEmail
 	}
 	p.OwnerName, p.OwnerEmail, p.OwnerLang, p.OwnerToken = name, email, lang(r), rand.Text()
 	if err := s.create(p); err != nil {
@@ -150,7 +164,7 @@ func (s *server) created(w http.ResponseWriter, r *http.Request, m mgr) {
 
 func validatePoll(p *Poll) string {
 	switch {
-	case p.Title == "" || utf8.RuneCountInString(p.Title) > 200:
+	case p.Title == "" || utf8.RuneCountInString(p.Title) > 200 || !singleLine(p.Title):
 		return "err.title"
 	case utf8.RuneCountInString(p.Description) > 5000:
 		return "err.description"

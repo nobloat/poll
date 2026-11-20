@@ -81,7 +81,7 @@ func TestPowVerify(t *testing.T) {
 	now := time.Now()
 	clock := func() time.Time { return now }
 	p := newPow(12, clock)
-	ch := p.issue()
+	ch := p.issue(0)
 	good := solveForTest(ch, 12)
 	if !p.verify(ch, good) {
 		t.Fatal("valid solution rejected")
@@ -90,7 +90,7 @@ func TestPowVerify(t *testing.T) {
 		t.Fatal("replay accepted")
 	}
 
-	ch = p.issue()
+	ch = p.issue(0)
 	for n := 0; ; n++ {
 		s := sha256.Sum256([]byte(ch + strconv.Itoa(n)))
 		if leadingZeroBits(s[:]) < 12 {
@@ -102,22 +102,22 @@ func TestPowVerify(t *testing.T) {
 	}
 
 	other := newPow(12, clock)
-	ch = other.issue()
+	ch = other.issue(0)
 	if p.verify(ch, solveForTest(ch, 12)) {
 		t.Fatal("foreign signature accepted")
 	}
-	tampered := "1" + p.issue()
+	tampered := "1" + p.issue(0)
 	if p.verify(tampered, solveForTest(tampered, 12)) {
 		t.Fatal("tampered challenge accepted")
 	}
 
-	ch = p.issue()
+	ch = p.issue(0)
 	sol := solveForTest(ch, 12)
 	now = now.Add(powTTL + time.Second)
 	if p.verify(ch, sol) {
 		t.Fatal("expired challenge accepted")
 	}
-	ch = p.issue()
+	ch = p.issue(0)
 	if !p.verify(ch, solveForTest(ch, 12)) || len(p.used) != 1 {
 		t.Fatalf("expired replay entries not pruned: %d", len(p.used))
 	}

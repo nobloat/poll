@@ -12,20 +12,27 @@ import (
 	"time"
 )
 
-const powTTL = 2 * time.Hour
+const (
+	powTTL = 10 * time.Minute
+	// ponytail: fail closed when this many proofs were spent within one or two TTLs; raise it if real traffic hits it.
+	powMaxUsed = 100_000
+)
 
+// pow hands out HMAC-signed challenges "issued.bits.rand.mac"; bits is the difficulty a challenge asks for, at least
+// difficulty. Spent challenges sit in two maps rotated every TTL, so replay checks never walk the set.
 type pow struct {
 	key        []byte
 	difficulty int
 	now        func() time.Time
 	mu         sync.Mutex
-	used       map[string]time.Time
+	used, prev map[string]bool
+	rotated    time.Time
 }
 
 func newPow(difficulty int, now func() time.Time) *pow {
 	key := make([]byte, 32)
 	rand.Read(key)
-	return &pow{key: key, difficulty: difficulty, now: now, used: map[string]time.Time{}}
+	return &pow{key: key, difficulty: difficulty, now: now, used: map[string]bool{}}
 }
 
 func (p *pow) mac(msg string) string {
@@ -34,9 +41,22 @@ func (p *pow) mac(msg string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func (p *pow) issue() string {
-	msg := strconv.FormatInt(p.now().Unix(), 10) + "." + rand.Text()
+func (p *pow) issue(bits int) string {
+	msg := strconv.FormatInt(p.now().Unix(), 10) + "." + strconv.Itoa(max(bits, p.difficulty)) + "." + rand.Text()
 	return msg + "." + p.mac(msg)
+}
+
+// challengeBits is the difficulty a challenge asks for, -1 if it has none. Trust it only after verify.
+func challengeBits(challenge string) int {
+	f := strings.Split(challenge, ".")
+	if len(f) != 4 {
+		return -1
+	}
+	n, err := strconv.Atoi(f[1])
+	if err != nil || n < 0 || n > 64 {
+		return -1
+	}
+	return n
 }
 
 func leadingZeroBits(b []byte) int {
@@ -57,23 +77,22 @@ func (p *pow) verify(challenge, nonce string) bool {
 	}
 	ts, err := strconv.ParseInt(challenge[:strings.IndexByte(challenge, '.')], 10, 64)
 	issued, now := time.Unix(ts, 0), p.now()
-	if err != nil || now.Sub(issued) > powTTL || issued.After(now.Add(time.Minute)) {
+	if err != nil || now.Sub(issued) >= powTTL || issued.After(now.Add(time.Minute)) {
 		return false
 	}
+	need := challengeBits(challenge)
 	sum := sha256.Sum256([]byte(challenge + nonce))
-	if leadingZeroBits(sum[:]) < p.difficulty {
+	if need < p.difficulty || leadingZeroBits(sum[:]) < need {
 		return false
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for c, exp := range p.used {
-		if now.After(exp) {
-			delete(p.used, c)
-		}
+	if now.Sub(p.rotated) >= powTTL {
+		p.prev, p.used, p.rotated = p.used, map[string]bool{}, now
 	}
-	if _, ok := p.used[challenge]; ok {
+	if p.used[challenge] || p.prev[challenge] || len(p.used) >= powMaxUsed {
 		return false
 	}
-	p.used[challenge] = issued.Add(powTTL)
+	p.used[challenge] = true
 	return true
 }

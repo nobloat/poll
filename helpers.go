@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -86,7 +87,7 @@ func parseOptions(text string, loc *time.Location, now time.Time) []Option {
 }
 
 func icsEscape(s string) string {
-	return strings.NewReplacer(`\`, `\\`, ";", `\;`, ",", `\,`, "\r\n", `\n`, "\n", `\n`).Replace(s)
+	return strings.NewReplacer(`\`, `\\`, ";", `\;`, ",", `\,`, "\r\n", `\n`, "\n", `\n`, "\r", `\n`).Replace(s)
 }
 
 func icsFold(line string) string {
@@ -167,4 +168,46 @@ func detectLang(header string) string {
 		}
 	}
 	return "en"
+}
+
+// singleLine reports whether s has no line breaks; titles and names go into mail subjects and greetings.
+func singleLine(s string) bool { return !strings.ContainsAny(s, "\r\n") }
+
+// limiter counts hits per key in fixed windows of length every.
+// ponytail: fixed windows allow up to twice a limit across a window boundary; sliding windows if that matters.
+type limiter struct {
+	every time.Duration
+	mu    sync.Mutex
+	start time.Time
+	n     map[string]int
+}
+
+type limit struct {
+	key string
+	max int
+}
+
+// allow counts one hit on every key if all of them are below their max (max 0 means no limit), else none.
+func (l *limiter) allow(now time.Time, ls ...limit) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.n == nil || now.Sub(l.start) >= l.every {
+		l.start, l.n = now, map[string]int{}
+	}
+	for _, x := range ls {
+		if x.max > 0 && l.n[x.key] >= x.max {
+			return false
+		}
+	}
+	for _, x := range ls {
+		l.n[x.key]++
+	}
+	return true
+}
+
+// over reports whether key reached max in the current window, without counting a hit.
+func (l *limiter) over(now time.Time, key string, max int) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.n != nil && now.Sub(l.start) < l.every && l.n[key] >= max
 }

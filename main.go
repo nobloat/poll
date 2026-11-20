@@ -28,14 +28,22 @@ func loadConfig() (config, error) {
 		return v
 	}
 	s := config{
-		BaseURL:       strings.TrimRight(req("BASE_URL"), "/"),
-		AdminPassword: req("ADMIN_PASSWORD"),
-		Loc:           time.Local,
-		Difficulty:    16,
-		DataDir:       "./data",
-		Addr:          ":" + cmp.Or(os.Getenv("PORT"), "8737"),
-		Theme:         cmp.Or(os.Getenv("THEME"), "minimal"),
-		SMTP:          smtpConfig{From: req("SMTP_FROM")},
+		BaseURL:        strings.TrimRight(req("BASE_URL"), "/"),
+		AdminPassword:  req("ADMIN_PASSWORD"),
+		AdminEmail:     strings.ToLower(strings.TrimSpace(os.Getenv("ADMIN_EMAIL"))),
+		Loc:            time.Local,
+		Difficulty:     16,
+		MailDifficulty: 20,
+		MailPerAddress: 5,
+		MailPerHour:    200,
+		CreatePerHour:  100,
+		DataDir:        "./data",
+		Addr:           ":" + cmp.Or(os.Getenv("PORT"), "8737"),
+		Theme:          cmp.Or(os.Getenv("THEME"), "minimal"),
+		SMTP:           smtpConfig{From: req("SMTP_FROM")},
+	}
+	if e := s.AdminEmail; e != "" && !validEmail(e) {
+		bad("ADMIN_EMAIL is not a valid address: %q", e)
 	}
 	if v := os.Getenv("PUBLIC_CREATE"); v != "" {
 		var err error
@@ -85,6 +93,16 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go func() { // delete polls 180 days after their last change, at start and then daily
+		for {
+			s.store.sweep(time.Now().AddDate(0, 0, -retentionDays))
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(24 * time.Hour):
+			}
+		}
+	}()
 	go func() {
 		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)

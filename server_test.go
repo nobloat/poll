@@ -129,7 +129,7 @@ func (e *testEnv) do(method, path string, form url.Values, admin bool, hdr ...st
 			form = url.Values{}
 		}
 		if !form.Has("pow") {
-			form.Set("pow", e.srv.pow.issue())
+			form.Set("pow", e.srv.pow.issue(0))
 			form.Set("nonce", "0")
 		}
 		body = strings.NewReader(form.Encode())
@@ -309,7 +309,7 @@ func TestPowSubmit(t *testing.T) {
 	e := newEnv(t)
 	e.createPoll("dinner", opts, false, false)
 	e.srv.pow.difficulty = 8
-	ch := e.srv.pow.issue()
+	ch := e.srv.pow.issue(0)
 	nonce := solveForTest(ch, 8)
 	f := url.Values{"name": {"A"}, "email": {"a@example.com"}, "choice": {"0"}, "pow": {ch}, "nonce": {nonce}}
 	if r := e.post("/p/dinner", f); r.status != 303 {
@@ -336,8 +336,8 @@ func TestMailFormat(t *testing.T) {
 	if a := e.mailsTo("owner@example.com"); !strings.HasPrefix(a[0].Subject, "New answer") {
 		t.Fatalf("creator mail not in the creator's language: %q", a[0].Subject)
 	}
-	if a := e.mailsTo("owner@example.com")[0]; !strings.Contains(a.Text, "Pizza") || !strings.Contains(a.Text, "01 Mo, 12.10.2026, 14:00–15:30  [1] ■") || !strings.Contains(a.Text, "Jörg") || strings.Contains(a.Text, "j@example.com") {
-		t.Fatalf("creator mail lacks the full results or leaks the email:\n%s", a.Text)
+	if a := e.mailsTo("owner@example.com")[0]; strings.Contains(a.Text, "Pizza") || !strings.Contains(a.Text, "  x Mo, 12.10.2026, 14:00–15:30") || !strings.Contains(a.Text, "Jörg") || !strings.Contains(a.Text, "/m/OWNER") || strings.Contains(a.Text, "j@example.com") {
+		t.Fatalf("creator mail must carry the choices and the link only (POLL-1), never the email:\n%s", a.Text)
 	}
 	e.post(e.manage("dinner")+"/close", url.Values{"option": {"0"}})
 	ms := e.mailsTo("j@example.com")
@@ -394,7 +394,7 @@ func TestTemplatesRender(t *testing.T) {
 		}
 		for _, name := range []string{"link", "admin", "closed", "manage"} {
 			for _, ev := range []string{"new", "changed", "removed"} {
-				d := mailData{Lang: lang, Poll: p, Answer: a, Public: "https://x/p/s", Link: "https://x", Event: ev, Choices: []string{"A"}, Results: results(p)}
+				d := mailData{Lang: lang, Poll: p, Answer: a, Public: "https://x/p/s", Link: "https://x", Event: ev, Choices: []string{"A"}}
 				var buf bytes.Buffer
 				if err := e.srv.mailText.ExecuteTemplate(&buf, name+".txt", d); err != nil {
 					t.Fatal(err)
@@ -586,20 +586,22 @@ func TestAnswering(t *testing.T) {
 	e := newEnv(t)
 	e.createPoll("dinner", opts, true, false)
 	e.createPoll("other", opts, false, false)
-
 	r := e.submit("dinner", "Anna", " Anna@Example.com ", 1)
 	l := e.linkPath("anna@example.com")
-	if !strings.Contains(r.body, `href="`+l+`"`) || len(e.mailsTo("anna@example.com")) != 1 || len(e.mailsTo("owner@example.com")) != 1 {
+	if strings.Contains(r.body, "/a/") || !strings.Contains(r.body, html.EscapeString(T("en", "sent.mail"))) || len(e.mailsTo("anna@example.com")) != 1 || len(e.mailsTo("owner@example.com")) != 1 {
 		t.Fatalf("submit: %d", r.status)
 	}
 	if c := results(e.poll("dinner")); c[0].Index != 1 || len(c[0].Names) != 1 {
 		t.Fatal("answer must count without any confirmation")
 	}
 
-	n := e.mailCount()
-	r = e.submit("dinner", "Mallory", "anna@example.com", 2)
-	if p := e.poll("dinner"); e.mailCount() != n || len(p.Answers) != 1 || p.Answers[0].Name != "Anna" || strings.Contains(r.body, "/a/") || !strings.Contains(r.body, html.EscapeString(T("en", "dup.title"))) {
-		t.Fatal("duplicate submission changed something or leaked the link")
+	// POLL-10: a duplicate looks exactly like a new answer; the address gets its existing link again.
+	r2 := e.post("/p/dinner", url.Values{"name": {"Mallory"}, "email": {"anna@example.com"}, "choice": {"2"}})
+	if p := e.poll("dinner"); r2.header.Get("Location") != "/p/dinner/sent" || len(p.Answers) != 1 || p.Answers[0].Name != "Anna" || len(e.mailsTo("owner@example.com")) != 1 {
+		t.Fatal("duplicate submission changed something or answered differently")
+	}
+	if ms := e.mailsTo("anna@example.com"); len(ms) != 2 || !strings.Contains(ms[1].Text, l) {
+		t.Fatal("duplicate submission must mail the existing link to the address")
 	}
 
 	token := l[strings.LastIndex(l, "/")+1:]
@@ -720,11 +722,11 @@ func TestAnsweringWithNoOption(t *testing.T) {
 	if p := e.poll("dinner"); len(p.Answers) != 2 || len(p.Answers[1].Choices) != 0 {
 		t.Fatal("an answer without any option must be accepted")
 	}
-	none := T("en", "results.none") + ": "
-	if r := e.get("/p/dinner"); !strings.Contains(r.body, none+`<span class="names">Lukas</span>`) {
+	none := T("en", "results.none")
+	if r := e.get("/p/dinner"); !strings.Contains(r.body, none+": "+`<span class="names">Lukas</span>`) {
 		t.Fatal("public results must list who picked nothing separately")
 	}
-	if ms := e.mailsTo("owner@example.com"); !strings.Contains(ms[len(ms)-1].Text, none+"Lukas") {
+	if ms := e.mailsTo("owner@example.com"); !strings.Contains(ms[len(ms)-1].Text, "  "+T("en", "results.none")+"\n") {
 		t.Fatalf("creator mail must list who picked nothing:\n%s", ms[len(ms)-1].Text)
 	}
 	if e.post("/p/dinner", url.Values{"name": {"Two"}, "choice": {"0", "1"}}).status != 400 {

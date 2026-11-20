@@ -101,7 +101,7 @@ func (c smtpConfig) send(m Mail) error {
 	}
 	cl, err := c.dial()
 	if err != nil {
-		return err
+		return fmt.Errorf("smtp connect: %v", err) // %v: a 5xx here (auth, STARTTLS) is our config, not permanent
 	}
 	defer cl.Close()
 	if err := cl.Mail(c.From); err != nil {
