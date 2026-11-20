@@ -436,7 +436,9 @@ func (s *server) mail(to, name, subject string, d mailData, ics []byte) error {
 	var txt bytes.Buffer
 	err := s.mailText.ExecuteTemplate(&txt, name+".txt", d)
 	if err == nil {
-		err = s.outbox.enqueue(Mail{To: to, Subject: subject, Text: txt.String(), ICS: ics})
+		// Mail templates may be checked out with CRLF (git autocrlf on Windows); the body is LF either way.
+		text := strings.ReplaceAll(txt.String(), "\r\n", "\n")
+		err = s.outbox.enqueue(Mail{To: to, Subject: subject, Text: text, ICS: ics})
 	}
 	if err != nil {
 		log.Printf("mail %s to=%q subject=%q: %v", name, to, subject, err)
