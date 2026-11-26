@@ -669,7 +669,7 @@ func TestPowEverywhere(t *testing.T) {
 func TestPageTitle(t *testing.T) {
 	e := newEnv(t, func(c *config) { c.PublicCreate = true })
 	e.createPoll("dinner", opts, true, false)
-	for path, want := range map[string]string{"/": "<title>][✓</title>", "/new": "<title>][✓</title>", "/p/dinner": "<title>][✓ · Team Dinner Ü</title>", e.manage("dinner"): "<title>][✓ · Team Dinner Ü</title>"} {
+	for path, want := range map[string]string{"/": "<title>poll</title>", "/new": "<title>poll</title>", "/p/dinner": "<title>Team Dinner Ü · poll</title>", e.manage("dinner"): "<title>Team Dinner Ü · poll</title>"} {
 		if !strings.Contains(e.get(path).body, want) {
 			t.Errorf("%s: want %s", path, want)
 		}

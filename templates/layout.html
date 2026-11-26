@@ -4,7 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>][✓{{with .Poll}} · {{.Title}}{{end}}</title>
+<title>{{with .Poll}}{{.Title}} · {{end}}poll</title>
+<link rel="icon" href="/static/app-icon.svg">
+<link rel="manifest" href="/static/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/static/app-icon.png">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)"><meta name="theme-color" content="#1f2022" media="(prefers-color-scheme: dark)">
 <link rel="stylesheet" href="/static/app.css">
 <link rel="stylesheet" href="/theme.css{{with .Theme}}?theme={{.}}{{end}}" data-theme-css>
 <script type="module" src="/static/app.js"></script>
